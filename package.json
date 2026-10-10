@@ -1,6 +1,6 @@
 {
   "name": "opencode2-gpt-image",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "GPT Image generation for OpenCode 1 and 2 via Sub2API, CLIProxyAPI, or experimental Codex OAuth.",
   "type": "module",
   "license": "MIT",

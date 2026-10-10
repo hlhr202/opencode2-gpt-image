@@ -63,7 +63,7 @@ test("plugin options override environment and validate all new defaults", () => 
   }
 })
 
-test("plugin defaults apply in V1/V2, and tool arguments override them", async () => {
+test("plugin defaults apply in V1/V2 without per-call async overrides", async () => {
   const dir = await mkdtemp(join(tmpdir(), "gpt-defaults-"))
   const original = globalThis.fetch
   const calls: { url: string; body?: { model: string } }[] = []
@@ -82,26 +82,44 @@ test("plugin defaults apply in V1/V2, and tool arguments override them", async (
     const options = { baseURL: "https://proxy.test", apiKey: "key", defaultModel: "gpt-image-1" as const,
       asyncMode: "sub2api" as const, taskTimeoutSeconds: 2 }
     const tool = v2Tool(options, async () => dir, async () => undefined)
+    const statuses: string[] = []
     const ctx = { sessionID: "s", signal: new AbortController().signal,
-      progress: async () => {} } as unknown as ToolContext
+      progress: async ({ status }: { status: string }) => { statuses.push(status) } } as unknown as ToolContext
     const result = await tool.execute({ prompt: "bird" }, ctx)
     assert.equal(result.metadata?.model, "gpt-image-1")
+    assert.equal(result.metadata?.execution_mode, "sub2api")
+    assert.equal(result.metadata?.task_id, "imgtask_defaults")
+    assert.ok(Array.isArray(result.content))
+    assert.match((result.content[0] as { text: string }).text, /Sub2API async task imgtask_defaults completed/)
+    assert.match(tool.description, /Configured for Sub2API asynchronous submission/)
+    assert.equal("async_mode" in (tool.input as { properties: Record<string, unknown> }).properties, false)
+    assert.equal("timeout_seconds" in (tool.input as { properties: Record<string, unknown> }).properties, false)
     assert.equal(calls[0].url, "https://proxy.test/v1/images/generations/async")
     assert.equal(calls[0].body?.model, "gpt-image-1")
     assert.equal(calls[1].url, "https://proxy.test/v1/images/tasks/imgtask_defaults")
+    assert.equal(statuses[0], "Submitting Sub2API async image task")
+    assert.match(statuses[1], /imgtask_defaults: queued/)
+    assert.ok(statuses.every((status) => !status.includes("undefined")))
 
     const v1 = await GptImagePlugin.server({ directory: dir }, options)
-    const v1Tool = v1.tool.gpt_image as { execute(args: unknown, ctx: unknown): Promise<{ metadata: { model: string } }> }
-    const override = await v1Tool.execute({ prompt: "bird", model: "gpt-image-2", async_mode: false },
+    const v1Tool = v1.tool.gpt_image as { args: Record<string, unknown>; description: string;
+      execute(args: unknown, ctx: unknown): Promise<{ metadata: { model: string; execution_mode: string; task_id: string } }> }
+    assert.equal("async_mode" in v1Tool.args, false)
+    assert.equal("timeout_seconds" in v1Tool.args, false)
+    assert.match(v1Tool.description, /Configured for Sub2API asynchronous submission/)
+    const override = await v1Tool.execute({ prompt: "bird", model: "gpt-image-2" },
       { directory: dir, abort: ctx.signal, metadata: () => {} })
     assert.equal(override.metadata.model, "gpt-image-2")
-    assert.equal(calls[2].url, "https://proxy.test/v1/images/generations")
+    assert.equal(override.metadata.execution_mode, "sub2api")
+    assert.equal(override.metadata.task_id, "imgtask_defaults")
+    assert.equal(calls[2].url, "https://proxy.test/v1/images/generations/async")
     assert.equal(calls[2].body?.model, "gpt-image-2")
 
-    await assert.rejects(generateImage({ prompt: "bird", async_mode: false, timeout_seconds: 1 }, dir, options), /only used with async_mode/)
+    await assert.rejects(generateImage({ prompt: "bird", async_mode: false } as never, dir, options), /plugin configuration/)
     const task = await v2TaskTool(options, async () => dir).execute({ task_id: "imgtask_defaults" }, ctx)
     assert.ok(Array.isArray(task.content))
-    assert.equal(calls[3].url, "https://proxy.test/v1/images/tasks/imgtask_defaults")
+    assert.equal(task.metadata?.task_id, "imgtask_defaults")
+    assert.equal(calls[4].url, "https://proxy.test/v1/images/tasks/imgtask_defaults")
   } finally {
     globalThis.fetch = original
     await rm(dir, { recursive: true, force: true })
@@ -139,8 +157,8 @@ test("insecureTLS switches certificate validation for real API requests without 
     await assert.rejects(generateImage({ prompt: "bird" }, dir, { baseURL, apiKey: "key", insecureTLS: false }),
       /fetch failed|certificate|self.signed/i)
     assert.equal(requests.length, 0)
-    const files = await generateImage({ prompt: "bird", async_mode: true }, dir,
-      { baseURL, apiKey: "key", insecureTLS: true })
+    const files = await generateImage({ prompt: "bird" }, dir,
+      { baseURL, apiKey: "key", insecureTLS: true, asyncMode: "sub2api" })
     assert.deepEqual(requests, ["/v1/images/generations/async", "/v1/images/tasks/imgtask_tls", "/image.png"])
     assert.deepEqual(await readFile(files[0].path), PNG)
     const resumed = await resumeImageTask("imgtask_tls", dir, { baseURL, apiKey: "key", insecureTLS: true })
@@ -166,10 +184,46 @@ test("V1 and V2 register the same generation and task tools", async () => {
   assert.deepEqual((tools[0].input as { required: string[] }).required, ["prompt"])
   const v1 = await GptImagePlugin.server({ directory: "/project" })
   assert.deepEqual(Object.keys(v1.tool), ["gpt_image", "gpt_image_task"])
-  const tool = v1.tool.gpt_image as { args: Record<string, unknown> }
+  const tool = v1.tool.gpt_image as { args: Record<string, unknown>; description: string }
   assert.deepEqual(Object.keys(tool.args).sort(), Object.keys((tools[0].input as { properties: Record<string, unknown> }).properties).sort())
   const task = v1.tool.gpt_image_task as { args: Record<string, unknown> }
   assert.deepEqual(Object.keys(task.args).sort(), Object.keys((tools[1].input as { properties: Record<string, unknown> }).properties).sort())
+  assert.match(tools[0].description, /Configured for synchronous image requests/)
+  assert.match(tool.description as string, /Configured for synchronous image requests/)
+  assert.equal("async_mode" in tool.args, false)
+  assert.equal("timeout_seconds" in tool.args, false)
+})
+
+test("Codex tool descriptions and schemas reflect its configured backend", async () => {
+  const options = { backend: "codex" as const }
+  const v2 = v2Tool(options, async () => "/session", async () => undefined)
+  const v1 = await GptImagePlugin.server({ directory: "/session" }, options)
+  const properties = (v2.input as { properties: Record<string, { enum?: string[]; maxItems?: number }> }).properties
+  const v1Args = (v1.tool.gpt_image as { args: Record<string, { safeParse(value: unknown): { success: boolean } }> }).args
+  assert.match(v2.description, /transparent\/opaque/)
+  assert.match((v1.tool.gpt_image as { description: string }).description, /transparent\/opaque/)
+  assert.deepEqual(properties.model.enum, ["gpt-image-2"])
+  assert.deepEqual(properties.quality.enum, ["auto", "low", "medium", "high"])
+  assert.deepEqual(properties.output_format.enum, ["png"])
+  assert.equal(properties.images.maxItems, 5)
+  assert.equal("mask" in properties, false)
+  assert.equal("mask" in v1Args, false)
+  assert.equal("async_mode" in properties, false)
+  assert.equal(v1Args.output_format.safeParse("webp").success, false)
+  assert.equal(v1Args.quality.safeParse("high").success, true)
+  assert.equal(v1Args.model.safeParse("gpt-image-1").success, false)
+  assert.deepEqual(Object.keys(v1.tool), ["gpt_image"])
+  const registered: Info[] = []
+  await GptImagePlugin.setup({
+    options,
+    tool: { transform: async (callback: (editor: { add(tool: Info): void }) => void) =>
+      callback({ add: (item) => registered.push(item) }) },
+    session: { get: async () => ({ location: { directory: "/session" } }) },
+    integration: { connection: { active: async () => undefined, resolve: async () => undefined } },
+  } as unknown as Plugin.Context)
+  assert.deepEqual(registered.map((item) => item.name), ["gpt_image"])
+  assert.throws(() => v2Tool({ backend: "codex", asyncMode: "sub2api" }, async () => "/", async () => undefined), /require backend: api/)
+  assert.throws(() => resolveOptions({ backend: "codex", defaultModel: "gpt-image-1" }), /requires defaultModel: gpt-image-2/)
 })
 
 test("both versions use session directory, cancellation, and actual PNG file content", async () => {
@@ -187,6 +241,8 @@ test("both versions use session directory, cancellation, and actual PNG file con
     const result = await v2.execute({ prompt: "a crane", output_dir: "assets/img" }, {
       sessionID: "session-1", signal: controller.signal, progress: async () => {},
     } as unknown as ToolContext)
+    assert.equal(result.metadata?.execution_mode, "sync")
+    assert.equal(result.metadata?.backend, "api")
     assert.equal(calls[0].url, "https://proxy.test/v1/images/generations")
     assert.equal(calls[0].body.model, "gpt-image-2")
     assert.equal(calls[0].signal, controller.signal)
@@ -250,6 +306,28 @@ test("proxy-compatible image URLs are downloaded and identified from bytes", asy
   }
 })
 
+test("transparent requests disclose incompatible returned JPEG without resubmitting", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "gpt-transparency-"))
+  const original = globalThis.fetch
+  let calls = 0
+  globalThis.fetch = async () => {
+    calls++
+    return new Response(JSON.stringify({ data: [{ b64_json: Buffer.from("ffd8ff0000", "hex").toString("base64") }] }))
+  }
+  try {
+    const tool = v2Tool({ baseURL: "https://proxy.test", apiKey: "key" }, async () => dir, async () => undefined)
+    const result = await tool.execute({ prompt: "transparent bird", background: "transparent" },
+      { sessionID: "s", signal: new AbortController().signal, progress: async () => {} } as unknown as ToolContext)
+    assert.equal(calls, 1)
+    assert.ok(Array.isArray(result.content))
+    assert.match((result.content[0] as { text: string }).text, /JPEG, which cannot contain transparency/)
+    assert.equal((result.content[1] as { mime: string }).mime, "image/jpeg")
+  } finally {
+    globalThis.fetch = original
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
 test("reference image edit uses JSON images and PNG mask on the edits endpoint", async () => {
   const dir = await mkdtemp(join(tmpdir(), "gpt-edit-"))
   const original = globalThis.fetch
@@ -307,8 +385,9 @@ test("Sub2API async generations submit, poll with same key, and download stored 
     return new Response(PNG)
   }
   try {
-    const files = await generateImage({ prompt: "bird", async_mode: true, timeout_seconds: 3 }, dir,
-      { baseURL: "https://proxy.test/v1", apiKey: "key" }, undefined, undefined, (status) => { statuses.push(status) })
+    const files = await generateImage({ prompt: "bird" }, dir,
+      { baseURL: "https://proxy.test/v1", apiKey: "key", asyncMode: "sub2api", taskTimeoutSeconds: 3 },
+      undefined, undefined, (status) => { statuses.push(status) })
     assert.deepEqual(calls, [
       "https://proxy.test/v1/images/generations/async",
       "https://proxy.test/v1/images/tasks/imgtask_123",
@@ -343,8 +422,8 @@ test("Sub2API async edits and resume polling work in both plugin tool surfaces",
       result: { data: [{ b64_json: PNG.toString("base64") }] } }))
   }
   try {
-    const options = { baseURL: "https://proxy.test", apiKey: "key" }
-    const generated = await generateImage({ prompt: "edit", images: ["input.png"], async_mode: true }, dir, options)
+    const options = { baseURL: "https://proxy.test", apiKey: "key", asyncMode: "sub2api" as const }
+    const generated = await generateImage({ prompt: "edit", images: ["input.png"] }, dir, options)
     assert.equal(generated.length, 1)
     const taskTool = v2TaskTool(options, async () => dir)
     const context = { sessionID: "session-1", signal: new AbortController().signal,
@@ -367,10 +446,10 @@ test("Sub2API async edits and resume polling work in both plugin tool surfaces",
 test("disabled async endpoint, task failure and invalid task IDs are explicit", async () => {
   const dir = await mkdtemp(join(tmpdir(), "gpt-async-error-"))
   const original = globalThis.fetch
-  const options = { baseURL: "https://proxy.test", apiKey: "key" }
+  const options = { baseURL: "https://proxy.test", apiKey: "key", asyncMode: "sub2api" as const }
   globalThis.fetch = async () => new Response(JSON.stringify({ error: { message: "disabled" } }), { status: 404 })
   try {
-    await assert.rejects(generateImage({ prompt: "bird", async_mode: true }, dir, options), /Enable image object storage/)
+    await assert.rejects(generateImage({ prompt: "bird" }, dir, options), /Enable image object storage/)
     await assert.rejects(resumeImageTask("../evil", dir, options), /Invalid Sub2API image task ID/)
     globalThis.fetch = async () => new Response(JSON.stringify({ task_id: "imgtask_1", status: "failed",
       error: { message: "upstream rejected" } }))
@@ -391,9 +470,36 @@ test("an accepted Sub2API task times out with its ID and is never submitted twic
       { status: 202, headers: { "Retry-After": "3" } })
   }
   try {
-    await assert.rejects(generateImage({ prompt: "bird", async_mode: true, timeout_seconds: 1 }, dir,
-      { baseURL: "https://proxy.test", apiKey: "key" }), /imgtask_pending timed out/)
+    await assert.rejects(generateImage({ prompt: "bird" }, dir,
+      { baseURL: "https://proxy.test", apiKey: "key", asyncMode: "sub2api", taskTimeoutSeconds: 1 }), /imgtask_pending timed out/)
     assert.equal(submits, 1)
+  } finally {
+    globalThis.fetch = original
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("failed async polling and image saving preserve the accepted task ID", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "gpt-async-recovery-"))
+  const original = globalThis.fetch
+  let submissions = 0
+  globalThis.fetch = async (input) => {
+    const url = String(input)
+    if (url.endsWith("/generations/async")) {
+      submissions++
+      return new Response(JSON.stringify({ task_id: "imgtask_recover", status: "processing" }),
+        { status: 202, headers: { "Retry-After": "0" } })
+    }
+    if (url.endsWith("/tasks/imgtask_recover")) {
+      return new Response(JSON.stringify({ task_id: "imgtask_recover", status: "completed",
+        result: { data: [{ url: "https://storage.test/missing.png" }] } }))
+    }
+    return new Response("unavailable", { status: 503 })
+  }
+  try {
+    await assert.rejects(generateImage({ prompt: "bird" }, dir,
+      { baseURL: "https://proxy.test", apiKey: "key", asyncMode: "sub2api" }), /imgtask_recover completed, but saving its images failed/)
+    assert.equal(submissions, 1)
   } finally {
     globalThis.fetch = original
     await rm(dir, { recursive: true, force: true })
@@ -423,6 +529,46 @@ test("experimental Codex route uses Images endpoint, not Responses", async () =>
   }
 })
 
+test("Codex forwards count, size, quality and transparency; reports actual values", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "gpt-codex-options-"))
+  const original = globalThis.fetch
+  let calls = 0
+  globalThis.fetch = async (url, init) => {
+    calls++
+    assert.equal(url, "https://chatgpt.com/backend-api/codex/images/generations")
+    assert.deepEqual(JSON.parse(String(init?.body)), {
+      model: "gpt-image-2", prompt: "a crane", background: "transparent", quality: "high",
+      size: "1024x1024", n: 2,
+    })
+    return new Response(JSON.stringify({ data: [{ b64_json: PNG.toString("base64") }],
+      size: "1024x1536", quality: "medium", background: "transparent" }))
+  }
+  try {
+    const tool = v2Tool({ backend: "codex" }, async () => dir, async () => ({ access: "token" }))
+    const result = await tool.execute({ prompt: "a crane", size: "1024x1024", quality: "high",
+      background: "transparent", count: 2 }, { sessionID: "s", signal: new AbortController().signal,
+      progress: async () => {} } as unknown as ToolContext)
+    assert.equal(calls, 1)
+    assert.equal(result.metadata?.execution_mode, "sync")
+    assert.equal(result.metadata?.backend, "codex")
+    assert.deepEqual(result.metadata?.backend_reported, { size: "1024x1536", quality: "medium", background: "transparent" })
+    assert.ok(Array.isArray(result.content))
+    const text = (result.content[0] as { text: string }).text
+    assert.match(text, /Requested 2 image\(s\), but the backend returned 1/)
+    assert.match(text, /Requested size 1024x1024, but the backend reported 1024x1536/)
+    assert.match(text, /Requested quality high, but the backend reported medium/)
+    assert.equal((result.content[1] as { mime: string }).mime, "image/png")
+    await assert.rejects(generateImage({ prompt: "a crane", mask: "mask.png", images: ["image.png"] }, dir,
+      { backend: "codex" }), /does not support image masks/)
+    await assert.rejects(generateImage({ prompt: "a crane", output_format: "webp" }, dir,
+      { backend: "codex" }), /cannot guarantee JPEG or WebP/)
+    assert.equal(calls, 1)
+  } finally {
+    globalThis.fetch = original
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
 test("experimental Codex edit sends reference images to its edits endpoint", async () => {
   const dir = await mkdtemp(join(tmpdir(), "gpt-codex-edit-"))
   const original = globalThis.fetch
@@ -437,8 +583,8 @@ test("experimental Codex edit sends reference images to its edits endpoint", asy
     const files = await generateImage({ prompt: "edit", images: ["reference.png"] }, dir, { backend: "codex" },
       undefined, async () => ({ access: "token" }))
     assert.equal(files.length, 1)
-    await assert.rejects(generateImage({ prompt: "edit", images: ["reference.png"], async_mode: true },
-      dir, { backend: "codex" }, undefined, async () => ({ access: "token" })), /does not support/)
+    await assert.rejects(generateImage({ prompt: "edit", images: ["reference.png"] },
+      dir, { backend: "codex", asyncMode: "sub2api" }, undefined, async () => ({ access: "token" })), /require backend: api/)
   } finally {
     globalThis.fetch = original
     await rm(dir, { recursive: true, force: true })

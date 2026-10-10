@@ -17,8 +17,14 @@ export interface ImageArgs {
   output_dir?: string
   images?: string[]
   mask?: string
-  async_mode?: boolean
-  timeout_seconds?: number
+}
+
+export interface ImageRunDetails {
+  backend: "api" | "codex"
+  mode: "sync" | "sub2api"
+  taskID?: string
+  notices: string[]
+  reported?: { size?: string; quality?: string; background?: string }
 }
 
 export interface GeneratedImage {
@@ -34,7 +40,12 @@ export interface CodexAuth {
 
 export type AuthLoader = () => Promise<CodexAuth | undefined>
 
-type ImageResponse = { data?: { b64_json?: string; b64?: string; url?: string }[] }
+type ImageResponse = {
+  data?: { b64_json?: string; b64?: string; url?: string }[]
+  size?: string
+  quality?: string
+  background?: string
+}
 type TaskResponse = {
   id?: string
   task_id?: string
@@ -88,13 +99,8 @@ function validate(args: ImageArgs): void {
   if (args.mask !== undefined && (!args.images?.length || typeof args.mask !== "string" || !args.mask.trim())) {
     throw new Error("mask requires at least one reference image")
   }
-  if (args.async_mode !== undefined && typeof args.async_mode !== "boolean") throw new Error("async_mode must be a boolean")
-  if (args.timeout_seconds !== undefined &&
-      (!Number.isInteger(args.timeout_seconds) || args.timeout_seconds < 1 || args.timeout_seconds > 1800)) {
-    throw new Error("timeout_seconds must be an integer from 1 to 1800")
-  }
-  if (args.timeout_seconds !== undefined && !args.async_mode) {
-    throw new Error("timeout_seconds is only used with async_mode")
+  if ("async_mode" in args || "timeout_seconds" in args) {
+    throw new Error("Image submission mode and timeout are plugin configuration, not gpt_image arguments")
   }
 }
 
@@ -191,7 +197,7 @@ async function pollTask(id: string, options: ResolvedOptions, transport: ImageTr
 }
 
 async function callAPI(args: ImageArgs, directory: string, options: ResolvedOptions, transport: ImageTransport, signal?: AbortSignal,
-  progress?: (status: string) => void | Promise<void>): Promise<ImageResponse> {
+  progress?: (status: string) => void | Promise<void>, details?: ImageRunDetails): Promise<ImageResponse> {
   const { images, mask } = await imageInputs(args, directory)
   const endpoint = images ? "/images/edits" : "/images/generations"
   const body = {
@@ -205,13 +211,14 @@ async function callAPI(args: ImageArgs, directory: string, options: ResolvedOpti
     ...(images ? { images: images.map((image_url) => ({ image_url })) } : {}),
     ...(mask ? { mask: { image_url: mask } } : {}),
   }
-  const url = imageEndpoint(options.baseURL, `${endpoint}${args.async_mode ? "/async" : ""}`)
-  const controller = args.async_mode ? new AbortController() : undefined
+  const asyncMode = options.asyncMode === "sub2api"
+  const url = imageEndpoint(options.baseURL, `${endpoint}${asyncMode ? "/async" : ""}`)
+  const controller = asyncMode ? new AbortController() : undefined
   const abort = () => controller?.abort(signal?.reason)
   if (signal?.aborted) abort()
   else signal?.addEventListener("abort", abort, { once: true })
   const timer = controller ? setTimeout(() => controller.abort(new Error("Image task polling timed out")),
-    (args.timeout_seconds ?? 1800) * 1000) : undefined
+    options.taskTimeoutSeconds * 1000) : undefined
   const activeSignal = controller?.signal ?? signal
   let taskID: string | undefined
   try {
@@ -221,7 +228,7 @@ async function callAPI(args: ImageArgs, directory: string, options: ResolvedOpti
       body: JSON.stringify(body),
       signal: activeSignal,
     })
-    if (!args.async_mode) return requireImages(await checkedJson<ImageResponse>(res))
+    if (!asyncMode) return requireImages(await checkedJson<ImageResponse>(res))
     if (res.status !== 202) {
       await checkedJson(res, true)
       throw new Error(`Expected Sub2API task acceptance (202), got ${res.status}`)
@@ -229,11 +236,16 @@ async function callAPI(args: ImageArgs, directory: string, options: ResolvedOpti
     const submission = await checkedJson<TaskResponse>(res)
     const id = taskId(submission.task_id ?? submission.id ?? "")
     taskID = id
+    if (details) details.taskID = id
     await progress?.(`Sub2API image task ${id}: ${submission.status ?? "submitted"}`)
     return await pollTask(id, options, transport, activeSignal, progress, retryDelay(res))
   } catch (error) {
     if (controller?.signal.aborted && !signal?.aborted) {
       throw new Error(`Sub2API image task${taskID ? ` ${taskID}` : ""} timed out. It may still complete remotely; do not submit the request again blindly.`, { cause: error })
+    }
+    if (taskID) {
+      if (error instanceof Error && error.message.startsWith(`Sub2API image task ${taskID} `)) throw error
+      throw new Error(`Sub2API image task ${taskID} ${signal?.aborted ? "polling was cancelled" : "polling failed"}. Resume it with gpt_image_task; do not submit again.`, { cause: error })
     }
     throw error
   } finally {
@@ -244,15 +256,11 @@ async function callAPI(args: ImageArgs, directory: string, options: ResolvedOpti
 
 async function callCodex(args: ImageArgs, directory: string, loadAuth: AuthLoader | undefined, signal?: AbortSignal): Promise<ImageResponse> {
   if (modelName(args.model) !== "gpt-image-2") throw new Error("Codex backend only supports gpt-image-2")
-  if ((args.count ?? 1) !== 1 || (args.quality && args.quality !== "auto") ||
-      (args.output_format && args.output_format !== "png")) {
-    throw new Error("Codex backend supports one PNG per call; quality is selected by the backend")
-  }
-  if (args.async_mode || args.mask) throw new Error("Codex backend does not support Sub2API async tasks or image masks")
-  if (args.images && args.images.length > 5) throw new Error("Codex backend supports at most 5 reference images")
+  if (args.output_format && args.output_format !== "png") throw new Error("Codex backend cannot guarantee JPEG or WebP output")
+  if (args.mask) throw new Error("Codex backend does not support image masks")
+  if (args.images && args.images.length > 5) throw new Error("This plugin currently limits Codex to 5 reference images")
   const auth = await loadAuth?.()
   if (!auth?.access) throw new Error("No active ChatGPT Codex OAuth connection")
-  const sizeHint = args.size && args.size !== "auto" ? ` Generate the image with a width of ${args.size.split("x")[0]} pixels and a height of ${args.size.split("x")[1]} pixels.` : ""
   const { images } = await imageInputs(args, directory)
   const endpoint = images ? "edits" : "generations"
   return requireImages(await checkedJson<ImageResponse>(await fetch(`https://chatgpt.com/backend-api/codex/images/${endpoint}`, {
@@ -265,10 +273,11 @@ async function callCodex(args: ImageArgs, directory: string, loadAuth: AuthLoade
     },
     body: JSON.stringify({
       model: "gpt-image-2",
-      prompt: args.prompt + sizeHint,
+      prompt: args.prompt,
       background: args.background ?? "opaque",
-      quality: "auto",
-      size: "auto",
+      quality: args.quality ?? "auto",
+      size: args.size ?? "auto",
+      ...(args.count !== undefined ? { n: args.count } : {}),
       ...(images ? { images: images.map((image_url) => ({ image_url })) } : {}),
     }),
     signal,
@@ -296,21 +305,48 @@ export async function generateImage(
   signal?: AbortSignal,
   loadAuth?: AuthLoader,
   progress?: (status: string) => void | Promise<void>,
+  onResult?: (details: ImageRunDetails) => void,
 ): Promise<GeneratedImage[]> {
   const config = resolveOptions(options)
-  const asyncMode = args.async_mode ?? (config.asyncMode === "sub2api")
-  const effective: ImageArgs = {
-    ...args,
-    model: args.model ?? config.defaultModel,
-    async_mode: asyncMode,
-    timeout_seconds: args.timeout_seconds ?? (asyncMode ? config.taskTimeoutSeconds : undefined),
-  }
+  const effective: ImageArgs = { ...args, model: args.model ?? config.defaultModel }
   validate(effective)
+  const details: ImageRunDetails = { backend: config.backend, mode: config.asyncMode, notices: [] }
   const transport = await createTransport(config.backend === "api" && config.insecureTLS)
   try {
     const json = config.backend === "codex" ? await callCodex(effective, directory, loadAuth, signal) :
-      await callAPI(effective, directory, config, transport, signal, progress)
-    return await saveImages(json, effective.output_dir, directory, transport, signal)
+      await callAPI(effective, directory, config, transport, signal, progress, details)
+    let images: GeneratedImage[]
+    try {
+      images = await saveImages(json, effective.output_dir, directory, transport, signal)
+    } catch (error) {
+      if (details.taskID) {
+        throw new Error(`Sub2API image task ${details.taskID} completed, but saving its images failed. Resume with gpt_image_task rather than submitting again.`, { cause: error })
+      }
+      throw error
+    }
+    const { size, quality, background } = json
+    if (size || quality || background) details.reported = { ...(size ? { size } : {}),
+      ...(quality ? { quality } : {}), ...(background ? { background } : {}) }
+    if (effective.count !== undefined && images.length !== effective.count) {
+      details.notices.push(`Requested ${effective.count} image(s), but the backend returned ${images.length}.`)
+    }
+    if (effective.output_format && images.some((image) => image.mime !== `image/${effective.output_format}`)) {
+      details.notices.push(`The backend returned a different image format than requested ${effective.output_format}; files were saved in their actual format.`)
+    }
+    if (effective.background === "transparent" && images.some((image) => image.mime === "image/jpeg")) {
+      details.notices.push("Requested transparent background, but the backend returned JPEG, which cannot contain transparency.")
+    }
+    for (const field of ["size", "quality", "background"] as const) {
+      if (config.backend === "codex" && effective[field] && effective[field] !== "auto") {
+        if (json[field] && json[field] !== effective[field]) {
+          details.notices.push(`Requested ${field} ${effective[field]}, but the backend reported ${json[field]}.`)
+        } else if (!json[field]) {
+          details.notices.push(`Requested ${field} ${effective[field]} was sent, but the backend did not report its actual value.`)
+        }
+      }
+    }
+    onResult?.(details)
+    return images
   } finally {
     await transport.close()
   }

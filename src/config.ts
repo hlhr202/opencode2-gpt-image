@@ -12,6 +12,20 @@ export interface Options {
 
 export type ResolvedOptions = Required<Options>
 
+export function executionMode(options: Options = {}): { backend: "api" | "codex"; asyncMode: "sync" | "sub2api" } {
+  const backend = options.backend ?? (process.env.GPT_IMAGE_BACKEND as Options["backend"]) ?? "api"
+  if (backend !== "api" && backend !== "codex") throw new Error("backend must be api or codex")
+  const asyncMode = options.asyncMode ?? process.env.GPT_IMAGE_ASYNC_MODE ?? "sync"
+  if (asyncMode !== "sync" && asyncMode !== "sub2api") throw new Error("asyncMode must be sync or sub2api")
+  if (backend === "codex" && asyncMode === "sub2api") {
+    throw new Error("Sub2API async image tasks require backend: api")
+  }
+  if (backend === "codex" && modelName(options.defaultModel ?? process.env.GPT_IMAGE_DEFAULT_MODEL ?? DEFAULT_IMAGE_MODEL) !== "gpt-image-2") {
+    throw new Error("Codex backend requires defaultModel: gpt-image-2")
+  }
+  return { backend, asyncMode }
+}
+
 function optionalBoolean(value: string | undefined): boolean {
   if (value === undefined) return false
   if (/^(1|true)$/i.test(value)) return true
@@ -20,15 +34,12 @@ function optionalBoolean(value: string | undefined): boolean {
 }
 
 export function resolveOptions(options: Options = {}): ResolvedOptions {
-  const backend = options.backend ?? (process.env.GPT_IMAGE_BACKEND as Options["backend"]) ?? "api"
-  if (backend !== "api" && backend !== "codex") throw new Error("backend must be api or codex")
+  const { backend, asyncMode } = executionMode(options)
   const baseURL = options.baseURL ?? (process.env.GPT_IMAGE_BASE_URL || process.env.CPA_BASE_URL || "")
   const apiKey = options.apiKey ?? (process.env.GPT_IMAGE_API_KEY || process.env.CPA_API_KEY || "")
   const insecureTLS = options.insecureTLS ?? optionalBoolean(process.env.GPT_IMAGE_INSECURE_TLS)
   if (typeof insecureTLS !== "boolean") throw new Error("insecureTLS must be a boolean")
   const defaultModel = modelName(options.defaultModel ?? process.env.GPT_IMAGE_DEFAULT_MODEL ?? DEFAULT_IMAGE_MODEL)
-  const asyncMode = options.asyncMode ?? process.env.GPT_IMAGE_ASYNC_MODE ?? "sync"
-  if (asyncMode !== "sync" && asyncMode !== "sub2api") throw new Error("asyncMode must be sync or sub2api")
   const taskTimeoutSeconds = options.taskTimeoutSeconds ??
     (process.env.GPT_IMAGE_TASK_TIMEOUT_SECONDS === undefined ? 1800 : Number(process.env.GPT_IMAGE_TASK_TIMEOUT_SECONDS))
   if (!Number.isInteger(taskTimeoutSeconds) || taskTimeoutSeconds < 1 || taskTimeoutSeconds > 1800) {
