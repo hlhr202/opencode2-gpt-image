@@ -21,9 +21,13 @@ Add the plugin with its API connection options to `opencode.json`:
   "plugins": [{
     "package": "opencode2-gpt-image",
     "options": {
+      "backend": "api",
       "baseURL": "https://your-proxy.example.com/v1",
       "apiKey": "your-key",
-      "insecureTLS": false
+      "insecureTLS": false,
+      "defaultModel": "gpt-image-2",
+      "asyncMode": "sync",
+      "taskTimeoutSeconds": 1800
     }
   }]
 }
@@ -35,9 +39,13 @@ Add the plugin with its API connection options to `opencode.json`:
 {
   "$schema": "https://opencode.ai/config.json",
   "plugin": [["opencode2-gpt-image", {
+    "backend": "api",
     "baseURL": "https://your-proxy.example.com/v1",
     "apiKey": "your-key",
-    "insecureTLS": false
+    "insecureTLS": false,
+    "defaultModel": "gpt-image-2",
+    "asyncMode": "sync",
+    "taskTimeoutSeconds": 1800
   }]]
 }
 ```
