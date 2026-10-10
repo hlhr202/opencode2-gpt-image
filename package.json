@@ -1,0 +1,58 @@
+{
+  "name": "opencode2-gpt-image",
+  "version": "0.1.0",
+  "description": "GPT Image generation for OpenCode 1 and 2 via Sub2API, CLIProxyAPI, or experimental Codex OAuth.",
+  "type": "module",
+  "license": "MIT",
+  "author": "hlhr202",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hlhr202/opencode2-gpt-image.git"
+  },
+  "homepage": "https://github.com/hlhr202/opencode2-gpt-image#readme",
+  "bugs": {
+    "url": "https://github.com/hlhr202/opencode2-gpt-image/issues"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "gpt-image",
+    "image-generation",
+    "sub2api",
+    "cliproxyapi",
+    "openai-compatible"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "packageManager": "pnpm@10.30.3",
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.18.29",
+    "undici": "^7.30.0"
+  },
+  "devDependencies": {
+    "@opencode/plugin": "^2.0.26",
+    "@types/node": "^22.15.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test test/*.test.ts",
+    "prepack": "pnpm build"
+  }
+}
